@@ -127,6 +127,93 @@ NATURES = {
 
 TYPES_EAU = ["eau_surface", "eau_souterraine", "eau_atmospherique", "eau_usee"]
 
+ETAPES = {
+    "pretraitement": "Prétraitement",
+    "clarification": "Clarification",
+    "coagulation_renforcee": "Coagulation renforcée",
+    "deferrisation": "Déferrisation",
+    "demanganisation": "Démanganisation",
+    "correction_agressivite": "Correction de l'agressivité",
+    "correction_incrustation": "Correction de l'incrustation",
+    "adoucissement": "Adoucissement",
+    "defluoruration": "Défluoruration",
+    "correction_ph": "Correction du pH",
+    "traitement_biologique": "Traitement biologique",
+    "pretraitement_physico_chimique": "Prétraitement physico-chimique",
+    "traitement_azote": "Traitement de l'azote",
+    "traitement_phosphore": "Traitement du phosphore",
+    "desinfection": "Désinfection",
+    "desinfection_rejet": "Désinfection du rejet",
+    "aucun": "Aucun",
+}
+
+
+def libelle_etape(etape):
+    return ETAPES.get(etape, etape.replace("_", " ").capitalize())
+
+
+PARAMETRES_BACTERIO = ["e_coli", "coliformes_totaux", "coliformes_fecaux",
+                       "streptocoques_fecaux", "clostridium_perfringens", "germes_banals"]
+
+
+def valider_norme(norme):
+    """Vérifie et normalise une norme personnalisée.
+
+    Format : {"nom": str, "parametres": {param: {"limite": x} ou {"min": a, "max": b},
+    "nature" facultative}}. Lève ValueError avec un message lisible.
+    """
+    if not isinstance(norme, dict) or not isinstance(norme.get("parametres"), dict):
+        raise ValueError("La norme doit contenir un dictionnaire « parametres ».")
+    nom = str(norme.get("nom") or "Norme personnalisée").strip()
+    propres = {}
+    for param, regle in norme["parametres"].items():
+        if param not in PARAMETRES:
+            raise ValueError(f"Paramètre inconnu : « {param} ».")
+        if not isinstance(regle, dict):
+            raise ValueError(f"{libelle(param)} : règle invalide.")
+        nature = regle.get("nature", "reglementaire")
+        if nature not in NATURES:
+            raise ValueError(f"{libelle(param)} : nature « {nature} » inconnue.")
+        def nombre(cle):
+            valeur = regle.get(cle)
+            if valeur is None or (isinstance(valeur, float) and math.isnan(valeur)):
+                return None
+            try:
+                return float(valeur)
+            except (TypeError, ValueError):
+                raise ValueError(f"{libelle(param)} : « {valeur} » n'est pas un nombre.") from None
+
+        limite, mini, maxi = nombre("limite"), nombre("min"), nombre("max")
+        if limite is not None:
+            propres[param] = {"limite": limite, "nature": nature}
+        elif mini is not None and maxi is not None:
+            if mini >= maxi:
+                raise ValueError(f"{libelle(param)} : le minimum doit être inférieur au maximum.")
+            propres[param] = {"min": mini, "max": maxi, "nature": nature}
+        else:
+            raise ValueError(f"{libelle(param)} : indiquer une limite, ou un minimum et un maximum.")
+    if not propres:
+        raise ValueError("La norme ne contient aucun paramètre.")
+    return {"nom": nom, "parametres": propres}
+
+
+# Classes de risque sanitaire selon E. coli (UFC/100 mL), d'après l'OMS
+CLASSES_RISQUE_ECOLI = [
+    (0, "conforme", "Aucun risque détecté"),
+    (10, "faible", "Risque faible"),
+    (100, "intermediaire", "Risque intermédiaire"),
+    (1000, "eleve", "Risque élevé"),
+    (math.inf, "tres_eleve", "Risque très élevé"),
+]
+
+
+def classer_risque_ecoli(ufc_100ml):
+    """Retourne (code, libellé) de la classe de risque OMS pour E. coli."""
+    for borne, code, texte in CLASSES_RISQUE_ECOLI:
+        if ufc_100ml <= borne:
+            return code, texte
+    return CLASSES_RISQUE_ECOLI[-1][1:]
+
 # ============================================================================
 # CHIMIE DES CARBONATES
 # ============================================================================
@@ -205,10 +292,14 @@ class DiagnosticEau:
             raise ValueError(f"Type d'eau inconnu : {type_eau}")
         self.type_eau = type_eau
         self.valeurs = dict(valeurs_parametres)
-        self.norme = norme if norme in NORMES_EAU_POTABLE else "OMS_2011"
+        # norme : clé de NORMES_EAU_POTABLE, ou dictionnaire de norme personnalisée
+        self.norme_personnalisee = valider_norme(norme) if isinstance(norme, dict) else None
+        self.norme = norme if isinstance(norme, str) and norme in NORMES_EAU_POTABLE else "OMS_2011"
 
     # ---------------------------------------------------------------- normes
     def referentiel(self):
+        if self.norme_personnalisee:
+            return self.norme_personnalisee
         if self.type_eau == "eau_usee":
             return NORMES_REJET_EAU_USEE
         return NORMES_EAU_POTABLE[self.norme]
@@ -502,7 +593,52 @@ class DiagnosticEau:
                     "dose_aluminium_mgL": round(p * 0.87, 1),
                 })
 
+        traitements.extend(self._traitements_bacteriologiques())
         return traitements
+
+    # --------------------------------------------------------- bactériologie
+    def analyse_bacteriologique(self):
+        """Synthèse bactériologique, ou None si aucune analyse n'a été saisie."""
+        saisis = [p for p in PARAMETRES_BACTERIO if p in self.valeurs]
+        if not saisis:
+            return None
+        resultat = {"parametres": {p: self.valeurs[p] for p in saisis}}
+        if "e_coli" in self.valeurs:
+            resultat["classe_risque"], resultat["risque"] = classer_risque_ecoli(self.valeurs["e_coli"])
+        resultat["contamination_fecale"] = any(
+            self.valeurs.get(p, 0) > 0
+            for p in ("e_coli", "coliformes_fecaux", "streptocoques_fecaux")
+        )
+        return resultat
+
+    def _traitements_bacteriologiques(self):
+        bacterio = self.analyse_bacteriologique()
+        if bacterio is None:
+            return []
+        if self.type_eau == "eau_usee":
+            if self._depasse("coliformes_fecaux", 2000):
+                return [{
+                    "etape": "desinfection_rejet",
+                    "detail": "Coliformes fécaux au-delà de la norme de rejet - Désinfection tertiaire "
+                              "(lagune de maturation, UV ou chloration-déchloration)",
+                }]
+            return []
+        if not bacterio["contamination_fecale"]:
+            if self.valeurs.get("coliformes_totaux", 0) > 0:
+                return [{
+                    "etape": "desinfection",
+                    "detail": "Coliformes totaux présents sans indicateur fécal - Vérifier l'efficacité "
+                              "du traitement et l'intégrité du réseau ; maintenir un chlore résiduel",
+                }]
+            return []
+        risque = bacterio.get("risque", "Contamination fécale détectée")
+        detail = (f"{risque} - Désinfection obligatoire (chlore résiduel libre ≥ 0,5 mg/L après "
+                  "30 min de contact à pH < 8). Rechercher et supprimer la source de contamination")
+        if self.type_eau == "eau_souterraine":
+            detail += " (périmètre de protection, étanchéité de la tête de forage, latrines proches)"
+        if self.valeurs.get("turbidite", 0) > 1:
+            detail += ". Turbidité > 1 NTU : clarifier avant de désinfecter"
+        return [{"etape": "desinfection", "detail": detail}]
 
     # ---------------------------------------------------------------- filière
     def construire_filiere(self):
@@ -562,7 +698,10 @@ class DiagnosticEau:
                     filiere.append(f"🧫 Traitement biologique secondaire : {filiere_bio}")
             if self._depasse("ntk", 40) or self._depasse("phosphore_total", 10):
                 filiere.append("🎯 Traitement tertiaire (dénitrification / déphosphatation)")
-            filiere.append("🧴 Désinfection (si rejet en zone sensible)")
+            if self._depasse("coliformes_fecaux", 2000):
+                filiere.append("🧴 Désinfection (obligatoire : coliformes fécaux au-delà de la norme)")
+            else:
+                filiere.append("🧴 Désinfection (si rejet en zone sensible)")
 
         elif self.type_eau == "eau_atmospherique":
             filiere = ["🧹 Filtration grossière (premières eaux écartées)"]
@@ -622,8 +761,82 @@ class DiagnosticEau:
             "date_diagnostic": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "parametres_saisis": self.valeurs,
             "equilibre_calcocarbonique": self.details_langelier(),
+            "bacteriologie": self.analyse_bacteriologique(),
             "non_conformites": self.analyser_conformite(),
             "traitements_proposes": self.determiner_traitements(),
             "filiere_traitement": self.construire_filiere(),
             "recommandations_suivi": self.recommandations_suivi(),
         }
+
+
+# ============================================================================
+# CHLORATION
+# ============================================================================
+
+G_CL2_PAR_DEGRE_CHLOROMETRIQUE = 3.17  # g de chlore actif par litre et par degré
+CT_REFERENCE_OMS = 15.0  # mg·min/L : 0,5 mg/L de chlore libre après 30 min (pH < 8)
+FACTEURS_CHICANAGE = {
+    0.1: "Bassin sans chicanes (mélange intégral)",
+    0.3: "Chicanage médiocre (entrée/sortie simples)",
+    0.5: "Chicanage moyen (chicanes intermédiaires)",
+    0.7: "Bon chicanage (bassin serpentin)",
+    1.0: "Écoulement piston (conduite)",
+}
+
+
+def pka_hypochloreux(t_celsius):
+    """pKa du couple HOCl/ClO⁻ (Morris, 1966)."""
+    T = t_celsius + 273.15
+    return 3000.0 / T - 10.0686 + 0.0253 * T
+
+
+def dimensionner_chloration(debit_m3j, demande_mgL, residuel_mgL=0.5, ph=7.0,
+                            temperature=25.0, facteur_chicanage=0.3,
+                            ct_requis=CT_REFERENCE_OMS, purete_hth=0.65,
+                            degre_javel=12.0):
+    """Dimensionne une chloration au chlore libre.
+
+    debit_m3j : débit à traiter (m³/j)
+    demande_mgL : demande en chlore de l'eau (mg/L), à mesurer par essai
+    residuel_mgL : chlore libre résiduel visé en sortie du bassin de contact (mg/L)
+    facteur_chicanage : T10/T du bassin de contact (0,1 à 1)
+    ct_requis : CT à atteindre (mg·min/L), 15 par défaut (critère OMS)
+    """
+    if debit_m3j <= 0 or residuel_mgL <= 0:
+        raise ValueError("Le débit et le chlore résiduel doivent être positifs.")
+    if not 0 < facteur_chicanage <= 1:
+        raise ValueError("Le facteur de chicanage doit être compris entre 0 et 1.")
+
+    dose = demande_mgL + residuel_mgL
+    chlore_kg_j = dose * debit_m3j / 1000
+    t10_min = ct_requis / residuel_mgL
+    temps_sejour_min = t10_min / facteur_chicanage
+    volume_m3 = debit_m3j / 1440 * temps_sejour_min
+    fraction_hocl = 1 / (1 + 10 ** (ph - pka_hypochloreux(temperature)))
+
+    avertissements = []
+    if ph >= 8:
+        avertissements.append(
+            f"pH {ph:.1f} ≥ 8 : seulement {fraction_hocl:.0%} du chlore libre est sous forme HOCl, "
+            "l'efficacité est fortement réduite. Corriger le pH ou augmenter le CT."
+        )
+    if residuel_mgL < 0.5:
+        avertissements.append("Résiduel visé < 0,5 mg/L : en dessous de la recommandation de l'OMS.")
+    if residuel_mgL > 5:
+        avertissements.append("Résiduel > 5 mg/L : au-delà de la valeur guide de l'OMS pour le chlore.")
+
+    return {
+        "debit_m3j": debit_m3j,
+        "dose_mgL": round(dose, 2),
+        "chlore_actif_kg_j": round(chlore_kg_j, 3),
+        "hth_kg_j": round(chlore_kg_j / purete_hth, 3),
+        "javel_L_j": round(chlore_kg_j * 1000 / (degre_javel * G_CL2_PAR_DEGRE_CHLOROMETRIQUE), 1),
+        "purete_hth": purete_hth,
+        "degre_javel": degre_javel,
+        "fraction_hocl": round(fraction_hocl, 3),
+        "ct_requis": ct_requis,
+        "t10_min": round(t10_min, 1),
+        "temps_sejour_min": round(temps_sejour_min, 1),
+        "volume_contact_m3": round(volume_m3, 1),
+        "avertissements": avertissements,
+    }
