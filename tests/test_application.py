@@ -48,6 +48,29 @@ def test_avertissement_si_parametres_modifies():
     assert any("ont changé" in w.value for w in at.warning)
 
 
+def test_bacteriologie_et_chloration():
+    at = lancer("eau_souterraine")
+    at.checkbox(key="bacterio_eau_souterraine").check().run()
+    at.number_input(key="eau_souterraine_e_coli").set_value(250).run()
+    at.button[0].click().run()
+    assert not at.exception
+    assert any("Risque élevé" in e.value for e in at.error)
+    assert "Dimensionnement de la chloration" in textes(at)
+    # La chloration se recalcule sans relancer le diagnostic
+    at.number_input(key="chl_debit").set_value(2000).run()
+    assert "RÉSULTATS DU DIAGNOSTIC" in textes(at)
+    assert any(m.label == "Bassin de contact" for m in at.metric)
+
+
+def test_norme_personnalisee_dans_l_interface():
+    at = lancer("eau_souterraine")
+    at.sidebar.selectbox(key="norme_potable").select("PERSONNALISEE").run()
+    assert not at.exception
+    assert not at.error  # le modèle (OMS) est une norme valide
+    at.button[0].click().run()
+    assert "Norme personnalisée" in " ".join(c.value for c in at.caption)
+
+
 def test_colonne_unites_lisible():
     at = lancer()
     at.button[0].click().run()
